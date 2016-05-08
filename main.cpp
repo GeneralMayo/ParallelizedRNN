@@ -214,11 +214,6 @@ void bptt(std::vector<int> &x, std::vector<int> &y, Weights &weights, int bptt_s
 	}
 	int prev_word;
 
-	//reset gradients
-	grads.dLdU = MatrixXd::Zero(HIDDEN_DIM,WORD_DIM);
-	grads.dLdV = MatrixXd::Zero(WORD_DIM,HIDDEN_DIM);
-	grads.dLdW = MatrixXd::Zero(HIDDEN_DIM,HIDDEN_DIM);
-
 	//for each output backwards
 	for(int i = y.size()-1; i>=0; i--){
 		grads.dLdV += delta_o.row(i).transpose()*fpd.S.row(i);
@@ -247,34 +242,44 @@ void bptt(std::vector<int> &x, std::vector<int> &y, Weights &weights, int bptt_s
 	}
 }
 
-void sgd_step(std::vector<int> &x, std::vector<int> &y, double learning_rate, Weights &master_weights
-				,int bptt_steps, Gradients &worker_grad, Weights &worker_weight){
-	//get gradients
-	bptt( x, y, worker_weight, bptt_steps, worker_grad);
+void sgd_step(std::vector<std::vector<int>> &x, std::vector<std::vector<int>> &y, double learning_rate, Weights &master_weights
+				,int bptt_steps, Gradients &worker_grad, Weights &worker_weight,int batch_start, int batch_end){
 	
+	//get gradients
+	for(int ex_idx = batch_start; ex_idx<batch_end; ex_idx++){
+		bptt(x[ex_idx], y[ex_idx], worker_weight, bptt_steps, worker_grad);
+	}
+
 	//updata weights
 	#pragma omp critical
 	{
+		int batch_size = batch_end - batch_start;
 		//update master
-		master_weights.U -= learning_rate * worker_grad.dLdU;
-	    master_weights.V -= learning_rate * worker_grad.dLdV;
-	    master_weights.W -= learning_rate * worker_grad.dLdW;
-
-	    //update worker's personal weights
-	    worker_weight = master_weights;
+		master_weights.U -= learning_rate * worker_grad.dLdU/batch_size;
+	    master_weights.V -= learning_rate * worker_grad.dLdV/batch_size;
+	    master_weights.W -= learning_rate * worker_grad.dLdW/batch_size;
 	}
+
+	//reset gradients
+	worker_grad.dLdU = MatrixXd::Zero(HIDDEN_DIM,WORD_DIM);
+	worker_grad.dLdV = MatrixXd::Zero(WORD_DIM,HIDDEN_DIM);
+	worker_grad.dLdW = MatrixXd::Zero(HIDDEN_DIM,HIDDEN_DIM);
+
+    //update worker's personal weights
+    worker_weight = master_weights;
 }
 
 double train_with_sgd(std::vector<std::vector<int>> &X_train, std::vector<std::vector<int>> &Y_train,
 				 double learning_rate, Weights &master_weights , int bptt_steps, int nepoch, 
 				 int evaluate_loss_after, int num_words, Gradients *worker_grads, Weights *worker_weights,
-				 int NUM_THREADS){
+				 int NUM_THREADS,int BATCH_SIZE){
+	
 	double prev_loss = -1;
 	double cur_loss = 0;
-	
 	double total_time = 0;
+	int batches = (int) ceil((double)X_train.size()/(double)BATCH_SIZE);
+	//printf("START_TRAINING\n");
 	int t_start = CycleTimer::currentSeconds();
-	printf("START_TRAINING\n");
 	for(int epoch = 0; epoch<nepoch; epoch++){
 		printf("epoch# %d\n",epoch);
 		//check loss
@@ -291,71 +296,88 @@ double train_with_sgd(std::vector<std::vector<int>> &X_train, std::vector<std::v
 			prev_loss = cur_loss;
 			t_start = CycleTimer::currentSeconds();
 		}
+
+		double temp = CycleTimer::currentSeconds();
 		#pragma omp parallel num_threads(NUM_THREADS)
 		{
-			#pragma omp for 
-			for(unsigned int tr_ex = 0; tr_ex < X_train.size(); tr_ex++){
-				//get new weights
-				sgd_step(X_train[tr_ex], Y_train[tr_ex], learning_rate, master_weights
-					,bptt_steps, worker_grads[omp_get_thread_num()],worker_weights[omp_get_thread_num()]);
+			#pragma omp for schedule(static,1)
+			for(int batch = 0; batch<batches; batch++){
+				int start = batch*BATCH_SIZE;
+				int end = std::min((int)X_train.size(),start+BATCH_SIZE);
+				if(start < X_train.size()){
+					//get new weights
+					sgd_step(X_train, Y_train, learning_rate, master_weights
+					,bptt_steps, worker_grads[omp_get_thread_num()],worker_weights[omp_get_thread_num()],
+					start, end);
+				}
 			}
 		}
 	}
 	total_time += CycleTimer::currentSeconds() - t_start;
+	printf("Loss: %f\n", cur_loss);
 	return total_time;
 }
 
 
 int main() {
-	int NUM_THREADS = 4;
-	double LEARNING_RATE_INIT = .01;
+	int NUM_THREADS = 1;
+	double LEARNING_RATE_INIT = .005;
 	int BPTT_STEPS = 4;
 	int NEPOCH = 10;
 	int EVALUATE_LOSS_AFTER = 1;
-
-	//Get Training Data
-	struct Training_Data td = get_training_data();
-
-	//Initialize Master Weights
-	struct Weights master_weights = init_weights(HIDDEN_DIM,WORD_DIM);
-
-	
-	//Initialize Worker Weights
-	Weights * worker_weights = new Weights[NUM_THREADS];
-	for(int i = 0; i< NUM_THREADS; i++){
-		worker_weights[i] = master_weights;
-	}
-	
-	//Initialize worker gradients
-	
-	struct Gradients grad_init = init_grads();
-	Gradients * worker_grads = new Gradients[NUM_THREADS];
-	for(int i = 0; i< NUM_THREADS; i++){
-		worker_grads[i] = grad_init;
-	}
-
+	int MINY_BATCH_SIZE = 10;
 	int EXAMPLE_NUM = 100;
-	int num_words = 0;
-	for(int i = 0; i<EXAMPLE_NUM; i++){
-		num_words+= td.Y_train[i].size();
+
+	int thread_vals[8] = {1,2,4,8,12,16,24,48};
+	int miny_batch_size_val[4] = {1,2,5,10};
+	for(int nt = 0; nt<8; nt++){
+	NUM_THREADS = thread_vals[nt];
+	for(int mb = 0; mb < 4; mb++){
+	MINY_BATCH_SIZE = miny_batch_size_val[mb];
+	printf("NUM_THREADS: %d, MINY_BATCH_SIZE: %d\n",NUM_THREADS,MINY_BATCH_SIZE);
+		//Get Training Data
+		struct Training_Data td = get_training_data();
+
+		//Initialize Master Weights
+		struct Weights master_weights = init_weights(HIDDEN_DIM,WORD_DIM);
+
+		
+		//Initialize Worker Weights
+		Weights * worker_weights = new Weights[NUM_THREADS];
+		for(int i = 0; i< NUM_THREADS; i++){
+			worker_weights[i] = master_weights;
+		}
+		
+		//Initialize worker gradients
+		struct Gradients grad_init = init_grads();
+		Gradients * worker_grads = new Gradients[NUM_THREADS];
+		for(int i = 0; i< NUM_THREADS; i++){
+			worker_grads[i] = grad_init;
+		}
+
+		int num_words = 0;
+		for(int i = 0; i<EXAMPLE_NUM; i++){
+			num_words+= td.Y_train[i].size();
+		}
+
+		std::vector<std::vector<int>>::const_iterator first_X = td.X_train.begin();
+		std::vector<std::vector<int>>::const_iterator last_X = td.X_train.begin() + EXAMPLE_NUM;
+		std::vector<std::vector<int>> X_train_sub(first_X, last_X);
+
+		std::vector<std::vector<int>>::const_iterator first_Y = td.Y_train.begin();
+		std::vector<std::vector<int>>::const_iterator last_Y = td.Y_train.begin() + EXAMPLE_NUM;
+		std::vector<std::vector<int>> Y_train_sub(first_Y, last_Y);
+		
+		
+
+		double total_time;
+		total_time = train_with_sgd(X_train_sub, Y_train_sub, LEARNING_RATE_INIT,
+					 master_weights , BPTT_STEPS,  NEPOCH, 
+					 EVALUATE_LOSS_AFTER, num_words, worker_grads, worker_weights, NUM_THREADS, MINY_BATCH_SIZE);
+
+
+		printf("total_time: %f\n", total_time);
 	}
-
-	std::vector<std::vector<int>>::const_iterator first_X = td.X_train.begin();
-	std::vector<std::vector<int>>::const_iterator last_X = td.X_train.begin() + EXAMPLE_NUM;
-	std::vector<std::vector<int>> X_train_sub(first_X, last_X);
-
-	std::vector<std::vector<int>>::const_iterator first_Y = td.Y_train.begin();
-	std::vector<std::vector<int>>::const_iterator last_Y = td.Y_train.begin() + EXAMPLE_NUM;
-	std::vector<std::vector<int>> Y_train_sub(first_Y, last_Y);
-	
-	
-
-	double total_time;
-	total_time = train_with_sgd(X_train_sub, Y_train_sub, LEARNING_RATE_INIT,
-				 master_weights , BPTT_STEPS,  NEPOCH, 
-				 EVALUATE_LOSS_AFTER, num_words, worker_grads, worker_weights, NUM_THREADS);
-
-
-	printf("total_time: %f\n", total_time);
+	}
 	return(0);
 }
