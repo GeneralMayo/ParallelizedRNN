@@ -247,25 +247,31 @@ void bptt(std::vector<int> &x, std::vector<int> &y, Weights &weights, int bptt_s
 	}
 }
 
-void sgd_step(std::vector<int> &x, std::vector<int> &y, double learning_rate, Weights &cur_weights
-				,int bptt_steps, Gradients &grads){
+void sgd_step(std::vector<int> &x, std::vector<int> &y, double learning_rate, Weights &master_weights
+				,int bptt_steps, Gradients &worker_grad, Weights &worker_weight){
 	//get gradients
-	bptt( x, y, cur_weights, bptt_steps, grads);
+	bptt( x, y, worker_weight, bptt_steps, worker_grad);
 	
 	//updata weights
-	cur_weights.U -= learning_rate * grads.dLdU;
-    cur_weights.V -= learning_rate * grads.dLdV;
-    cur_weights.W -= learning_rate * grads.dLdW;
+	#pragma omp critical
+	{
+		//update master
+		master_weights.U -= learning_rate * worker_grad.dLdU;
+	    master_weights.V -= learning_rate * worker_grad.dLdV;
+	    master_weights.W -= learning_rate * worker_grad.dLdW;
+
+	    //update worker's personal weights
+	    worker_weight = master_weights;
+	}
 }
 
 double train_with_sgd(std::vector<std::vector<int>> &X_train, std::vector<std::vector<int>> &Y_train,
-				 double learning_rate, Weights &cur_weights , int bptt_steps, int nepoch, 
-				 int evaluate_loss_after, int num_words, Gradients &grads){
+				 double learning_rate, Weights &master_weights , int bptt_steps, int nepoch, 
+				 int evaluate_loss_after, int num_words, Gradients *worker_grads, Weights *worker_weights,
+				 int NUM_THREADS){
 	double prev_loss = -1;
 	double cur_loss = 0;
 	
-	Weights prev_weights = cur_weights;
-
 	double total_time = 0;
 	int t_start = CycleTimer::currentSeconds();
 	printf("START_TRAINING\n");
@@ -276,7 +282,7 @@ double train_with_sgd(std::vector<std::vector<int>> &X_train, std::vector<std::v
 			total_time += CycleTimer::currentSeconds() - t_start;
 			printf("Calculating Loss...\n");
 
-			cur_loss = calculate_loss(X_train, Y_train, cur_weights, num_words);
+			cur_loss = calculate_loss(X_train, Y_train, master_weights, num_words);
 			printf("Loss: %f\n",cur_loss);
 			if(prev_loss != -1 && cur_loss > prev_loss){
 				learning_rate = learning_rate*.5;
@@ -285,12 +291,14 @@ double train_with_sgd(std::vector<std::vector<int>> &X_train, std::vector<std::v
 			prev_loss = cur_loss;
 			t_start = CycleTimer::currentSeconds();
 		}
-
-		//#pragma omp prallel
-		for(unsigned int tr_ex = 0; tr_ex < X_train.size(); tr_ex++){
-			//get new weights
-			sgd_step(X_train[tr_ex], Y_train[tr_ex], learning_rate, cur_weights
-				,bptt_steps, grads);
+		#pragma omp parallel num_threads(NUM_THREADS)
+		{
+			#pragma omp for 
+			for(unsigned int tr_ex = 0; tr_ex < X_train.size(); tr_ex++){
+				//get new weights
+				sgd_step(X_train[tr_ex], Y_train[tr_ex], learning_rate, master_weights
+					,bptt_steps, worker_grads[omp_get_thread_num()],worker_weights[omp_get_thread_num()]);
+			}
 		}
 	}
 	total_time += CycleTimer::currentSeconds() - t_start;
@@ -299,13 +307,32 @@ double train_with_sgd(std::vector<std::vector<int>> &X_train, std::vector<std::v
 
 
 int main() {
+	int NUM_THREADS = 4;
+	double LEARNING_RATE_INIT = .01;
+	int BPTT_STEPS = 4;
+	int NEPOCH = 10;
+	int EVALUATE_LOSS_AFTER = 1;
+
 	//Get Training Data
 	struct Training_Data td = get_training_data();
 
-	//Initialize Weights
-	struct Weights weights = init_weights(HIDDEN_DIM,WORD_DIM);
-	//Initialize Gradients
-	struct Gradients grads = init_grads();
+	//Initialize Master Weights
+	struct Weights master_weights = init_weights(HIDDEN_DIM,WORD_DIM);
+
+	
+	//Initialize Worker Weights
+	Weights * worker_weights = new Weights[NUM_THREADS];
+	for(int i = 0; i< NUM_THREADS; i++){
+		worker_weights[i] = master_weights;
+	}
+	
+	//Initialize worker gradients
+	
+	struct Gradients grad_init = init_grads();
+	Gradients * worker_grads = new Gradients[NUM_THREADS];
+	for(int i = 0; i< NUM_THREADS; i++){
+		worker_grads[i] = grad_init;
+	}
 
 	int EXAMPLE_NUM = 100;
 	int num_words = 0;
@@ -321,15 +348,12 @@ int main() {
 	std::vector<std::vector<int>>::const_iterator last_Y = td.Y_train.begin() + EXAMPLE_NUM;
 	std::vector<std::vector<int>> Y_train_sub(first_Y, last_Y);
 	
-	double LEARNING_RATE_INIT = .1;
-	int BPTT_STEPS = 4;
-	int NEPOCH = 20;
-	int EVALUATE_LOSS_AFTER = 1;
+	
 
 	double total_time;
 	total_time = train_with_sgd(X_train_sub, Y_train_sub, LEARNING_RATE_INIT,
-				 weights , BPTT_STEPS,  NEPOCH, 
-				 EVALUATE_LOSS_AFTER, num_words, grads);
+				 master_weights , BPTT_STEPS,  NEPOCH, 
+				 EVALUATE_LOSS_AFTER, num_words, worker_grads, worker_weights, NUM_THREADS);
 
 
 	printf("total_time: %f\n", total_time);
