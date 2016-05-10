@@ -161,7 +161,6 @@ void predict(std::vector<int> &x, Weights &weights){
 	for(unsigned int i = 0; i<predictions.size(); i++){
 		fpd.O.row(i).maxCoeff(&predictions[i]);
 	}
-	//return predictions;
 }
 
 double calculate_loss(std::vector<std::vector<int>> &x, std::vector<std::vector<int>> &y,
@@ -181,26 +180,6 @@ double calculate_loss(std::vector<std::vector<int>> &x, std::vector<std::vector<
 	}
 	return L/numWords;
 }
-
-void get_array_sum(Eigen::ArrayXf arr,std::string str){
-	double sum = 0;
-	for(int i = 0; i<arr.cols(); i++){
-		sum += arr(i);
-	}
-	std::cout<<str<<sum<<std::endl;
-}
-
-void get_matrix_sum(Eigen::MatrixXd mat,std::string str){
-	double sum = 0;
-	for(int i = 0; i<mat.rows(); i++){
-		for(int j = 0; j<mat.cols(); j++){	
-			sum += mat(i,j);
-		}
-	}
-	std::cout<<str<<sum<<std::endl;
-}
-
-
 
 void bptt(std::vector<int> &x, std::vector<int> &y, Weights &weights, int bptt_steps,
 						Gradients &grads){
@@ -242,15 +221,93 @@ void bptt(std::vector<int> &x, std::vector<int> &y, Weights &weights, int bptt_s
 	}
 }
 
+void bptt_optimized(std::vector<int> &x, std::vector<int> &y, Weights &weights, int bptt_steps,
+						Gradients &grads){
+	//forward propegation
+	Forward_Prop_Data fpd = forward_propegation(x, weights);
+
+	MatrixXd delta_o(y.size(),WORD_DIM);
+	delta_o = fpd.O;
+	for(unsigned int i = 0; i<y.size(); i++){
+		delta_o(i,y[i])-=1;
+	}
+	int prev_word;
+
+	grads.dLdV += delta_o.transpose()*fpd.S;
+
+	Eigen::Array<double,1,HIDDEN_DIM> delta_t;
+	for(int i = y.size()-1; i>=0; i--){
+		delta_t = (weights.V.transpose()*delta_o.row(i).transpose()).transpose().array() * (1-(fpd.S.row(i).array()*fpd.S.row(i).array()));
+		
+		//back propegation through time (at most bptt_steps)
+		for(int backProp = i; backProp>=std::max(0,i-bptt_steps); backProp--){
+			if(backProp == 0){
+				prev_word = y.size()-1;
+			} else {
+				prev_word = backProp -1;
+			}
+
+			grads.dLdW += delta_t.matrix().transpose()*fpd.S.row(prev_word);
+			grads.dLdU.col(x[backProp])+= delta_t.matrix().cast<double>();
+			delta_t = (weights.W.transpose()*delta_t.matrix().transpose()).transpose().array() * (1-(fpd.S.row(prev_word).array()*fpd.S.row(prev_word).array()));
+		}										
+	}
+}
+
+void bptt_optimized2(std::vector<int> &x, std::vector<int> &y, Weights &weights, int bptt_steps,
+						Gradients &grads){
+	//forward propegation
+	Forward_Prop_Data fpd = forward_propegation(x, weights);
+
+	MatrixXd delta_o(y.size(),WORD_DIM);
+	delta_o = fpd.O;
+	for(unsigned int i = 0; i<y.size(); i++){
+		delta_o(i,y[i])-=1;
+	}
+	int prev_word;
+
+	grads.dLdV += delta_o.transpose()*fpd.S;
+
+	Eigen::Array<double,1,HIDDEN_DIM> delta_t;
+	MatrixXd delta_t_mat(y.size(),HIDDEN_DIM);
+	delta_t_mat = (weights.V.transpose()*delta_o.transpose()).transpose().array() * (1-(fpd.S.array()*fpd.S.array()));
+	for(int i = y.size()-1; i>=0; i--){
+		//back propegation through time (at most bptt_steps)
+		if(i == 0){
+			prev_word = y.size()-1;
+		} else {
+			prev_word = i -1;
+		}
+		grads.dLdW += delta_t_mat.row(i).transpose()*fpd.S.row(prev_word);
+		grads.dLdU.col(x[i]) += delta_t_mat.row(i).cast<double>();
+		delta_t = (weights.W.transpose()*delta_t_mat.row(i).transpose()).transpose().array() * (1-(fpd.S.row(prev_word).array()*fpd.S.row(prev_word).array()));
+		for(int backProp = i-1; backProp>=std::max(0,i-bptt_steps); backProp--){
+			if(backProp == 0){
+				prev_word = y.size()-1;
+			} else {
+				prev_word = backProp -1;
+			}
+			grads.dLdW += delta_t.matrix().transpose()*fpd.S.row(prev_word);
+			grads.dLdU.col(x[backProp]) += delta_t.matrix().cast<double>();
+			delta_t = (weights.W.transpose()*delta_t.matrix().transpose()).transpose().array() * (1-(fpd.S.row(prev_word).array()*fpd.S.row(prev_word).array()));
+		}										
+	}
+}
+
+
 void sgd_step(std::vector<std::vector<int>> &x, std::vector<std::vector<int>> &y, double learning_rate, Weights &master_weights
 				,int bptt_steps, Gradients &worker_grad, Weights &worker_weight,int batch_start, int batch_end){
 	
 	//get gradients
+	double bptt_time = CycleTimer::currentSeconds();
 	for(int ex_idx = batch_start; ex_idx<batch_end; ex_idx++){
-		bptt(x[ex_idx], y[ex_idx], worker_weight, bptt_steps, worker_grad);
+		//bptt(x[ex_idx], y[ex_idx], worker_weight, bptt_steps, worker_grad);
+		//bptt_optimized(x[ex_idx], y[ex_idx], worker_weight, bptt_steps, worker_grad);
+		bptt_optimized2(x[ex_idx], y[ex_idx], worker_weight, bptt_steps, worker_grad);
 	}
 
 	//updata weights
+	double crit_time = CycleTimer::currentSeconds();
 	#pragma omp critical
 	{
 		int batch_size = batch_end - batch_start;
@@ -265,8 +322,8 @@ void sgd_step(std::vector<std::vector<int>> &x, std::vector<std::vector<int>> &y
 	worker_grad.dLdV = MatrixXd::Zero(WORD_DIM,HIDDEN_DIM);
 	worker_grad.dLdW = MatrixXd::Zero(HIDDEN_DIM,HIDDEN_DIM);
 
-    //update worker's personal weights
-    worker_weight = master_weights;
+	//update worker's personal weights
+	worker_weight = master_weights;
 }
 
 double train_with_sgd(std::vector<std::vector<int>> &X_train, std::vector<std::vector<int>> &Y_train,
@@ -278,7 +335,6 @@ double train_with_sgd(std::vector<std::vector<int>> &X_train, std::vector<std::v
 	double cur_loss = 0;
 	double total_time = 0;
 	int batches = (int) ceil((double)X_train.size()/(double)BATCH_SIZE);
-	//printf("START_TRAINING\n");
 	int t_start = CycleTimer::currentSeconds();
 	for(int epoch = 0; epoch<nepoch; epoch++){
 		printf("epoch# %d\n",epoch);
@@ -289,6 +345,7 @@ double train_with_sgd(std::vector<std::vector<int>> &X_train, std::vector<std::v
 
 			cur_loss = calculate_loss(X_train, Y_train, master_weights, num_words);
 			printf("Loss: %f\n",cur_loss);
+			printf("Time: %f\n",total_time);
 			if(prev_loss != -1 && cur_loss > prev_loss){
 				learning_rate = learning_rate*.5;
 				printf("New Learning Rate: %f\n", learning_rate);
@@ -323,10 +380,10 @@ int main() {
 	int NUM_THREADS = 1;
 	double LEARNING_RATE_INIT = .005;
 	int BPTT_STEPS = 4;
-	int NEPOCH = 10;
+	int NEPOCH = 50;
 	int EVALUATE_LOSS_AFTER = 1;
 	int MINY_BATCH_SIZE = 10;
-	int EXAMPLE_NUM = 100;
+	int EXAMPLE_NUM = 500;
 
 	int thread_vals[8] = {1,2,4,8,12,16,24,48};
 	int miny_batch_size_val[4] = {1,2,5,10};
@@ -334,13 +391,14 @@ int main() {
 	NUM_THREADS = thread_vals[nt];
 	for(int mb = 0; mb < 4; mb++){
 	MINY_BATCH_SIZE = miny_batch_size_val[mb];
+	NUM_THREADS = 1;
+	MINY_BATCH_SIZE = 1;
 	printf("NUM_THREADS: %d, MINY_BATCH_SIZE: %d\n",NUM_THREADS,MINY_BATCH_SIZE);
 		//Get Training Data
 		struct Training_Data td = get_training_data();
 
 		//Initialize Master Weights
 		struct Weights master_weights = init_weights(HIDDEN_DIM,WORD_DIM);
-
 		
 		//Initialize Worker Weights
 		Weights * worker_weights = new Weights[NUM_THREADS];
@@ -368,8 +426,6 @@ int main() {
 		std::vector<std::vector<int>>::const_iterator last_Y = td.Y_train.begin() + EXAMPLE_NUM;
 		std::vector<std::vector<int>> Y_train_sub(first_Y, last_Y);
 		
-		
-
 		double total_time;
 		total_time = train_with_sgd(X_train_sub, Y_train_sub, LEARNING_RATE_INIT,
 					 master_weights , BPTT_STEPS,  NEPOCH, 
